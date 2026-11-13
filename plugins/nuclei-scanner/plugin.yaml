@@ -1,0 +1,9 @@
+name: nuclei-scanner
+version: 1.0.0
+manifest_version: 1
+kind: standalone
+author: local
+description: "Run ProjectDiscovery Nuclei workflows against targets in an operator-defined scope allowlist."
+provides_tools:
+  - list_nuclei_workflows
+  - run_nuclei_workflow
