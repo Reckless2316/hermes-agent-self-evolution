@@ -18,11 +18,17 @@ from urllib.parse import urlsplit
 PLUGIN_ID = "nuclei-scanner"
 SEVERITIES = ("info", "low", "medium", "high", "critical", "unknown")
 YAML_SUFFIXES = {".yaml", ".yml"}
-
-# URL/host characters only: no whitespace, quotes, backslashes or userinfo ("@"),
-# and never a leading "-" that nuclei would read as a flag.
-_TARGET_RE = re.compile(r"^[A-Za-z0-9\[][A-Za-z0-9._~:/?#\[\]!$&()*+,;=%-]*$")
+SCHEMES = ("http", "https")
+DEFAULT_MAX_FINDINGS = 25
+MAX_TARGET_LENGTH = 2048
 _TEXT_LIMIT = 500
+
+# Characters allowed in a target: URL and host characters only. Whitespace, quotes,
+# backslashes and "@" (userinfo) are refused, and a leading "-" would be read by nuclei
+# as a flag. "*" is refused too, so a wildcard can never be scanned as if it were a host.
+_TARGET_RE = re.compile(r"^[A-Za-z0-9\[][A-Za-z0-9._~:/?#\[\]!$&()+,;=%-]*$")
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME_RE = re.compile(rf"^{_LABEL}(?:\.{_LABEL})*$")
 
 
 @dataclass
@@ -31,8 +37,9 @@ class Settings:
     timeout_seconds: int = 300
     rate_limit: int = 0          # requests/second; 0 = nuclei default
     concurrency: int = 0         # parallel templates; 0 = nuclei default
-    max_findings: int = 100
+    max_findings: int = DEFAULT_MAX_FINDINGS
     allowed_targets: list[str] = field(default_factory=list)
+    invalid_scope: list[str] = field(default_factory=list)
 
 
 def _raw_settings() -> dict:
@@ -55,47 +62,73 @@ def _int(value, default: int, minimum: int) -> int:
         return default
 
 
-def get_settings() -> Settings:
-    raw = _raw_settings()
+# -- scope ------------------------------------------------------------------
 
-    def pick(key: str, env: str, default):
-        value = raw.get(key)
-        if value in (None, "", []):
-            value = os.environ.get(env)
-        return default if value in (None, "") else value
-
-    allowed = pick("allowed_targets", "NUCLEI_ALLOWED_TARGETS", [])
-    if isinstance(allowed, str):
-        allowed = allowed.split(",")
-    return Settings(
-        workflows_dir=Path(
-            str(pick("workflows_dir", "NUCLEI_WORKFLOWS_DIR", "~/nuclei-templates/workflows"))
-        ).expanduser().resolve(),
-        timeout_seconds=_int(pick("timeout_seconds", "NUCLEI_TIMEOUT_SECONDS", 300), 300, 1),
-        rate_limit=_int(pick("rate_limit", "NUCLEI_RATE_LIMIT", 0), 0, 0),
-        concurrency=_int(pick("concurrency", "NUCLEI_CONCURRENCY", 0), 0, 0),
-        max_findings=_int(pick("max_findings", "NUCLEI_MAX_FINDINGS", 100), 100, 1),
-        allowed_targets=[str(a).strip().lower() for a in allowed if str(a).strip()],
-    )
+def _valid_hostname(name: str) -> bool:
+    return 0 < len(name) <= 253 and bool(_HOSTNAME_RE.match(name))
 
 
-# -- validation -------------------------------------------------------------
+def _ip_or_hostname(text: str) -> str | None:
+    """Return the normalized IP address or hostname for text, or None if it is neither."""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return text if _valid_hostname(text) else None
+
+
+def _split_port(text: str) -> str:
+    """Drop one ':port' suffix. IPv6 literals contain several colons and are left alone."""
+    if text.count(":") == 1:
+        host, _, port = text.partition(":")
+        if port.isdigit() and 0 < int(port) <= 65535:
+            return host
+    return text
+
+
+def normalize_scope_entry(entry: str) -> str | None:
+    """Canonical form of one allowed_targets entry, or None if it is not a valid scope.
+
+    Accepts '*', '*.domain', a hostname (a ':port' is ignored), an IP address, or a CIDR.
+    """
+    text = entry.strip().lower()
+    if text == "*":
+        return text
+    text = text.rstrip(".")
+    if not text:
+        return None
+    if "/" in text:
+        try:
+            ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            return None
+        return text
+    if text.startswith("*."):
+        return text if _valid_hostname(text[2:]) else None
+    return _ip_or_hostname(_split_port(text))
+
 
 def target_host(target: str) -> str | None:
-    """Return the lowercase host of a URL / host[:port] target, or None if malformed."""
-    if not _TARGET_RE.match(target):
+    """Normalized host of an http(s) URL or bare host[:port] target, or None if malformed."""
+    if len(target) > MAX_TARGET_LENGTH or not _TARGET_RE.match(target):
         return None
     try:
-        parts = urlsplit(target if "://" in target else f"//{target}")
+        if "://" in target:
+            if target.split("://", 1)[0].lower() not in SCHEMES:
+                return None
+            parts = urlsplit(target)
+        else:
+            parts = urlsplit(f"//{target}")
         _ = parts.port  # raises ValueError on a malformed port
         host = parts.hostname
     except ValueError:
         return None
-    return host.lower().rstrip(".") if host else None
+    if not host:
+        return None
+    return _ip_or_hostname(host.rstrip("."))
 
 
 def host_in_scope(host: str, allowed: list[str]) -> bool:
-    """Match host against exact names, '*.domain' wildcards, IPs/CIDRs, or '*'."""
+    """Match a normalized host against exact names, '*.domain' wildcards, IPs/CIDRs, or '*'."""
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
@@ -114,6 +147,53 @@ def host_in_scope(host: str, allowed: list[str]) -> bool:
     return False
 
 
+def get_settings() -> Settings:
+    raw = _raw_settings()
+
+    def pick(key: str, env: str, default):
+        value = raw.get(key)
+        if value in (None, "", []):
+            value = os.environ.get(env)
+        return default if value in (None, "") else value
+
+    scope = pick("allowed_targets", "NUCLEI_ALLOWED_TARGETS", [])
+    if isinstance(scope, str):
+        entries = scope.split(",")
+    elif isinstance(scope, (list, tuple)):
+        entries = list(scope)
+    else:
+        entries = [scope]
+
+    allowed: list[str] = []
+    invalid: list[str] = []
+    for entry in entries:
+        text = str(entry).strip()
+        if not text:
+            continue
+        normalized = normalize_scope_entry(text)
+        if normalized is None:
+            invalid.append(text)
+        elif normalized not in allowed:
+            allowed.append(normalized)
+
+    return Settings(
+        workflows_dir=Path(
+            str(pick("workflows_dir", "NUCLEI_WORKFLOWS_DIR", "~/nuclei-templates/workflows"))
+        ).expanduser().resolve(),
+        timeout_seconds=_int(pick("timeout_seconds", "NUCLEI_TIMEOUT_SECONDS", 300), 300, 1),
+        rate_limit=_int(pick("rate_limit", "NUCLEI_RATE_LIMIT", 0), 0, 0),
+        concurrency=_int(pick("concurrency", "NUCLEI_CONCURRENCY", 0), 0, 0),
+        max_findings=_int(
+            pick("max_findings", "NUCLEI_MAX_FINDINGS", DEFAULT_MAX_FINDINGS),
+            DEFAULT_MAX_FINDINGS, 1,
+        ),
+        allowed_targets=allowed,
+        invalid_scope=invalid,
+    )
+
+
+# -- findings ---------------------------------------------------------------
+
 def _workflow_files(workflows_dir: Path) -> list[str]:
     return sorted(
         p.relative_to(workflows_dir).as_posix()
@@ -127,19 +207,28 @@ def _clip(value):
 
 
 def _summarize(finding: dict) -> dict:
-    """Keep the fields that matter; drop raw requests/responses that flood context."""
-    info = finding.get("info") or {}
+    """Keep the fields that matter; drop raw requests and responses that flood context.
+
+    Every field is type-checked: one unexpected shape must not discard the whole scan.
+    """
+    info = finding.get("info") if isinstance(finding.get("info"), dict) else {}
+    extracted = finding.get("extracted-results")
+    reference = info.get("reference")
     out = {
         "template_id": finding.get("template-id"),
-        "name": info.get("name"),
+        "name": _clip(info.get("name")),
         "severity": info.get("severity"),
         "type": finding.get("type"),
         "host": finding.get("host"),
         "matched_at": _clip(finding.get("matched-at")),
         "matcher_name": finding.get("matcher-name"),
-        "extracted_results": [_clip(r) for r in (finding.get("extracted-results") or [])[:10]],
+        "extracted_results": (
+            [_clip(str(r)) for r in extracted[:5]] if isinstance(extracted, list) else None
+        ),
         "description": _clip(info.get("description")),
-        "reference": (info.get("reference") or [])[:3] if isinstance(info.get("reference"), list) else None,
+        "reference": (
+            [_clip(str(r)) for r in reference[:3]] if isinstance(reference, list) else None
+        ),
         "timestamp": finding.get("timestamp"),
     }
     return {k: v for k, v in out.items() if v not in (None, "", [])}
@@ -156,9 +245,13 @@ def _parse_findings(stdout: str, max_findings: int) -> tuple[list[dict], int]:
             continue
         try:
             obj = json.loads(line)
-            findings.append(_summarize(obj) if isinstance(obj, dict) else {"raw": _clip(str(obj))})
         except json.JSONDecodeError:
             findings.append({"raw": _clip(line)})
+            continue
+        if isinstance(obj, dict):
+            findings.append(_summarize(obj))
+        else:
+            findings.append({"raw": _clip(str(obj))})
     return findings, total
 
 
@@ -200,11 +293,15 @@ def run_nuclei_workflow(args: dict, **kwargs) -> str:
         if not target or not workflow_name:
             return _err("Both 'target' and 'workflow_name' are required.")
 
+        settings = get_settings()
+        if settings.invalid_scope:
+            return _err(
+                f"plugins.entries.{PLUGIN_ID}.settings.allowed_targets has invalid entries "
+                f"{settings.invalid_scope}. Use a host, *.domain, IP or CIDR."
+            )
         host = target_host(target)
         if host is None:
             return _err("Invalid target: expected a URL or host such as 'https://example.com'.")
-
-        settings = get_settings()
         if not settings.allowed_targets:
             return _err(
                 "No scan scope configured. List the hosts you are authorized to test in "

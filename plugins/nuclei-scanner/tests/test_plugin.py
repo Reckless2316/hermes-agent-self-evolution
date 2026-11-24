@@ -151,7 +151,11 @@ def test_scope_from_env_and_star(env, monkeypatch):
     assert "error" not in run(env, target="anything.org", workflow_name="wordpress-workflow.yaml")
 
 
-@pytest.mark.parametrize("target", ["-l/etc/passwd", "-u evil", "example.com -o /tmp/x", "exa mple.com", "http://example.com:notaport"])
+@pytest.mark.parametrize("target", [
+    "-l/etc/passwd", "-u evil", "example.com -o /tmp/x", "exa mple.com",
+    "http://example.com:notaport", "ftp://example.com", "*.example.com", "example..com",
+    "exa_mple.com", "-example.com", "https:///example.com",
+])
 def test_malformed_or_flag_like_target_refused(env, target):
     data = run(env, target=target, workflow_name="wordpress-workflow.yaml")
     assert "Invalid target" in data["error"] and not (env.tmp / "args").exists()
@@ -198,3 +202,49 @@ def test_slash_command(env):
     out = cmd("https://example.com wordpress-workflow.yaml")
     assert "3 finding(s)" in out and "[high] wp-xmlrpc https://example.com/xmlrpc.php" in out
     assert cmd("https://evil.org wordpress-workflow.yaml").startswith("Error:")
+
+
+def test_wildcard_allowlist_does_not_admit_wildcard_target(env):
+    env.settings["allowed_targets"] = ["*.example.com"]
+    assert "Invalid target" in run(env, target="*.example.com", workflow_name="wordpress-workflow.yaml")["error"]
+    assert "error" not in run(env, target="a.example.com", workflow_name="wordpress-workflow.yaml")
+
+
+def test_scope_entries_are_normalized(env):
+    env.settings["allowed_targets"] = ["Example.com:443", " *.Lab.TEST. ", "10.0.0.0/8"]
+    assert "error" not in run(env, target="https://EXAMPLE.com", workflow_name="wordpress-workflow.yaml")
+    assert "error" not in run(env, target="x.lab.test", workflow_name="wordpress-workflow.yaml")
+    assert "error" not in run(env, target="10.9.8.7", workflow_name="wordpress-workflow.yaml")
+
+
+@pytest.mark.parametrize("entry", ["*.", "exa mple.com", "example.com/24", "a..b", "10.0.0.0/33"])
+def test_invalid_scope_entry_refuses_every_scan(env, entry):
+    env.settings["allowed_targets"] = ["example.com", entry]
+    data = run(env, target="example.com", workflow_name="wordpress-workflow.yaml")
+    assert "invalid entries" in data["error"] and entry in data["error"]
+    assert not (env.tmp / "args").exists()
+
+
+def test_bare_star_dot_entry_is_not_allow_all(env):
+    env.settings["allowed_targets"] = ["*."]
+    assert "invalid entries" in run(env, target="example.com", workflow_name="wordpress-workflow.yaml")["error"]
+
+
+def test_default_max_findings_is_25(env):
+    env.settings.pop("max_findings", None)
+    assert env.tools.get_settings().max_findings == 25
+
+
+def test_summarize_tolerates_unexpected_shapes(env):
+    out = env.tools._summarize({"info": "oops", "extracted-results": "abc", "template-id": "t", "reference": {}})
+    assert out == {"template_id": "t"}
+
+
+def test_malformed_finding_does_not_discard_scan(env):
+    # The fixture's fake nuclei keeps its executable bit when its contents are replaced.
+    (env.bindir / "nuclei").write_text(
+        '#!/bin/sh\necho \'{"template-id":"a","info":"str","extracted-results":5}\'\necho \'[1,2]\'\n'
+    )
+    data = run(env, target="example.com", workflow_name="wordpress-workflow.yaml")
+    assert "error" not in data and data["findings_count"] == 2
+    assert data["findings"][0] == {"template_id": "a"} and data["findings"][1]["raw"] == "[1, 2]"
