@@ -26,7 +26,9 @@ _TEXT_LIMIT = 500
 # Characters allowed in a target: URL and host characters only. Whitespace, quotes,
 # backslashes and "@" (userinfo) are refused, and a leading "-" would be read by nuclei
 # as a flag. "*" is refused too, so a wildcard can never be scanned as if it were a host.
-_TARGET_RE = re.compile(r"^[A-Za-z0-9\[][A-Za-z0-9._~:/?#\[\]!$&()+,;=%-]*$")
+# "," is refused because nuclei's -u accepts a comma-separated list, which would scan
+# every entry after the first one without a scope check.
+_TARGET_RE = re.compile(r"^[A-Za-z0-9\[][A-Za-z0-9._~:/?#\[\]!$&()+;=%-]*$")
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _HOSTNAME_RE = re.compile(rf"^{_LABEL}(?:\.{_LABEL})*$")
 
@@ -117,6 +119,10 @@ def target_host(target: str) -> str | None:
                 return None
             parts = urlsplit(target)
         else:
+            # A bare host has no path. "192.168.1.0/24" would be read as host plus path,
+            # and nuclei would expand the CIDR, so any "/", "?" or "#" is refused here.
+            if re.search(r"[/?#]", target):
+                return None
             parts = urlsplit(f"//{target}")
         _ = parts.port  # raises ValueError on a malformed port
         host = parts.hostname

@@ -155,6 +155,9 @@ def test_scope_from_env_and_star(env, monkeypatch):
     "-l/etc/passwd", "-u evil", "example.com -o /tmp/x", "exa mple.com",
     "http://example.com:notaport", "ftp://example.com", "*.example.com", "example..com",
     "exa_mple.com", "-example.com", "https:///example.com",
+    # nuclei's -u expands lists and CIDRs; neither may reach it unchecked
+    "example.com,evil.org", "https://example.com/,https://evil.org",
+    "192.168.1.0/24", "10.0.0.0/8",
 ])
 def test_malformed_or_flag_like_target_refused(env, target):
     data = run(env, target=target, workflow_name="wordpress-workflow.yaml")
